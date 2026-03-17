@@ -107,7 +107,7 @@ app.post('/api/chat', async (req, res) => {
     const hotelContext = await getHotelContext(message)
 
     // System prompt
-    const systemPrompt = `คุณคือ AI Assistant ของโรงแรม ชื่อ "น้องซอง" 
+    const systemPrompt = `คุณคือ AI Assistant ของโรงแรม ชื่อ "น้อง SORA" 
 คุณพูดภาษาไทยเป็นหลัก สุภาพ เป็นมิตร และช่วยเหลือลูกค้าอย่างเต็มที่
 ตอบคำถามโดยอิงจากข้อมูลด้านล่างเท่านั้น หากไม่มีข้อมูลให้บอกว่าจะสอบถามพนักงานให้
 
