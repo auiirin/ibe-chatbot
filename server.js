@@ -2,149 +2,153 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const Anthropic = require('@anthropic-ai/sdk')
-const { createClient } = require('@supabase/supabase-js')
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-// Init clients
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
 
 // ======================================
-// ดึงข้อมูลโรงแรมจาก DB
+// Hotel Info — ใส่ข้อมูลโรงแรมตรงนี้เลย
 // ======================================
-async function getHotelContext(userMessage) {
-  const msg = userMessage.toLowerCase()
-  const context = []
+const HOTEL_INFO = `
+=== นโยบายและข้อมูลโรงแรม ===
+• เช็คอิน: 14:00 น. | เช็คเอาท์: 12:00 น.
+• Late check-out มีค่าบริการเพิ่มเติม
+• ยกเลิกฟรีก่อนเข้าพัก 3 วัน / น้อยกว่า 3 วันหักค่าธรรมเนียม 1 คืน
+• รับบัตรเครดิต Visa, Mastercard, JCB และ QR Code
+• WiFi ฟรีทุกพื้นที่ ความเร็ว 100 Mbps
+• ที่จอดรถฟรีสำหรับผู้เข้าพัก
+• ไม่อนุญาตให้นำสัตว์เลี้ยงเข้าพัก
+• Extra Bed 500 บาท/คืน รวมอาหารเช้า 1 ท่าน
 
-  // ดึงข้อมูลห้องพัก (ถ้าถามเรื่องห้อง/ราคา)
-  if (msg.match(/ห้อง|ราคา|พัก|rate|room|price|suite|deluxe|standard/)) {
-    const { data: rooms } = await supabase
-      .from('rooms')
-      .select('*')
-      .eq('available', true)
-      .order('price_per_night')
+=== บริการในโรงแรม ===
+• อาหารเช้าบุฟเฟต์ — 06:30-10:30 น. — 350 บาท/ท่าน
+• ร้านอาหาร The Garden — 11:00-22:00 น.
+• สระว่ายน้ำ — 06:00-21:00 น. — ฟรี
+• ฟิตเนส — 06:00-22:00 น. — ฟรี
+• สปา & นวด — 10:00-21:00 น. — เริ่มต้น 600 บาท
+• รับส่งสนามบิน — 24 ชั่วโมง — 500 บาท/เที่ยว
 
-    if (rooms?.length) {
-      const roomText = rooms.map(r =>
-        `• ${r.name} — ${r.price_per_night.toLocaleString()} บาท/คืน | ${r.capacity} คน | ${r.size_sqm} ตร.ม.\n  ${r.description}\n  สิ่งอำนวยความสะดวก: ${r.amenities.join(', ')}`
-      ).join('\n\n')
-      context.push(`=== ห้องพักที่มีให้บริการ ===\n${roomText}`)
-    }
+=== โปรโมชันปัจจุบัน ===
+• พักวันจันทร์-พฤหัส ลด 20% (จองล่วงหน้า 2 วัน)
+• จองล่วงหน้า 30 วัน ลด 25% (ชำระเต็มจำนวน ยกเลิกไม่ได้)
+• พัก 3 คืนขึ้นไป ฟรีอาหารเช้า 2 ท่านทุกวัน (Deluxe ขึ้นไป)
+
+=== ติดต่อ ===
+• โทร: 053-000-000
+• LINE: @soraso-hotel
+• จองออนไลน์: soraso-ibe-qa.vercel.app
+`
+
+// ======================================
+// Soraso IBE API
+// ======================================
+async function fetchIBERate({ checkIn, checkOut, adults = 2, children = 0 }) {
+  try {
+    const res = await fetch(`${process.env.SORASO_IBE_URL}/en/api/v1/Search/Availability`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'hotelcode': process.env.SORASO_HOTEL_CODE
+      },
+      body: JSON.stringify({
+        Room: 1,
+        Arrival: checkIn,
+        Departure: checkOut,
+        Adult: adults,
+        Child: children,
+        Infant: 0
+      }),
+      signal: AbortSignal.timeout(8000)
+    })
+    if (!res.ok) { console.error(`IBE API error: ${res.status}`); return null }
+    return await res.json()
+  } catch (err) {
+    console.error('IBE fetch error:', err.message)
+    return null
   }
+}
 
-  // ดึงบริการ (ถ้าถามเรื่องบริการ/สิ่งอำนวยความสะดวก)
-  if (msg.match(/บริการ|สระ|สปา|ฟิตเนส|อาหาร|รถ|สนามบิน|service|pool|spa|gym|restaurant/)) {
-    const { data: services } = await supabase
-      .from('services')
-      .select('*')
-      .eq('available', true)
-
-    if (services?.length) {
-      const svcText = services.map(s =>
-        `• ${s.name} | เวลา: ${s.hours} | ${s.price ? `ราคา: ${s.price} บาท` : 'ฟรี'}\n  ${s.description}`
-      ).join('\n\n')
-      context.push(`=== บริการของโรงแรม ===\n${svcText}`)
-    }
+function formatIBERate(data, checkIn, checkOut) {
+  if (!data) return null
+  try {
+    const rooms = Array.isArray(data) ? data : data.RoomTypes || data.rooms || data.results || data.data || []
+    if (!rooms.length) return `No rooms available for ${checkIn} - ${checkOut}`
+    const lines = rooms.map(r => {
+      const name = r.RoomTypeName || r.RoomName || r.name || 'Room'
+      const rate = r.Rate || r.TotalRate || r.ratePerNight || r.price || '-'
+      const currency = r.Currency || r.currency || 'THB'
+      const formatted = typeof rate === 'number' ? rate.toLocaleString() : rate
+      return `• ${name} — ${formatted} ${currency}/night`
+    }).join('\n')
+    return `=== Current Room Rates (Live from Soraso IBE) ===\nCheck-in: ${checkIn} | Check-out: ${checkOut}\n\n${lines}`
+  } catch (err) {
+    console.error('IBE format error:', err.message)
+    return null
   }
+}
 
-  // ดึง FAQ (ถ้าถามทั่วไป)
-  if (msg.match(/เช็คอิน|เช็คเอาท์|ยกเลิก|จอดรถ|wifi|บัตร|สัตว์|check|cancel|pet|park/)) {
-    const { data: faqs } = await supabase
-      .from('faqs')
-      .select('*')
-
-    if (faqs?.length) {
-      const faqText = faqs.map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n')
-      context.push(`=== FAQ & นโยบายโรงแรม ===\n${faqText}`)
-    }
-  }
-
-  // ดึงโปรโมชัน (ถ้าถามเรื่องโปรหรือส่วนลด)
-  if (msg.match(/โปร|ส่วนลด|ลด|discount|promotion|offer|deal/)) {
-    const today = new Date().toISOString().split('T')[0]
-    const { data: promos } = await supabase
-      .from('promotions')
-      .select('*')
-      .eq('active', true)
-      .lte('valid_from', today)
-      .gte('valid_until', today)
-
-    if (promos?.length) {
-      const promoText = promos.map(p =>
-        `• ${p.title}${p.discount_percent > 0 ? ` (ลด ${p.discount_percent}%)` : ''}\n  ${p.description}\n  เงื่อนไข: ${p.conditions}`
-      ).join('\n\n')
-      context.push(`=== โปรโมชันที่มีอยู่ตอนนี้ ===\n${promoText}`)
-    }
-  }
-
-  // ถ้าไม่ match อะไรเลย ดึง FAQ ทั้งหมด
-  if (context.length === 0) {
-    const { data: faqs } = await supabase.from('faqs').select('*')
-    if (faqs?.length) {
-      const faqText = faqs.map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n')
-      context.push(`=== FAQ & นโยบายโรงแรม ===\n${faqText}`)
-    }
-  }
-
-  return context.join('\n\n')
+function extractDates(msg) {
+  const today = new Date()
+  const fmt = d => d.toISOString().split('T')[0]
+  const add = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x }
+  if (msg.match(/วันนี้|tonight|today/i)) return { checkIn: fmt(today), checkOut: fmt(add(today, 1)) }
+  if (msg.match(/พรุ่งนี้|tomorrow/i)) return { checkIn: fmt(add(today, 1)), checkOut: fmt(add(today, 2)) }
+  if (msg.match(/สุดสัปดาห์|weekend/i)) { const sat = add(today, 6 - today.getDay()); return { checkIn: fmt(sat), checkOut: fmt(add(sat, 1)) } }
+  const months = { มกราคม:1,กุมภาพันธ์:2,มีนาคม:3,เมษายน:4,พฤษภาคม:5,มิถุนายน:6,กรกฎาคม:7,สิงหาคม:8,กันยายน:9,ตุลาคม:10,พฤศจิกายน:11,ธันวาคม:12 }
+  const match = msg.match(/(\d{1,2})\s*(มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)/)
+  if (match) { const ci = new Date(today.getFullYear(), months[match[2]] - 1, parseInt(match[1])); return { checkIn: fmt(ci), checkOut: fmt(add(ci, 1)) } }
+  return { checkIn: fmt(today), checkOut: fmt(add(today, 1)) }
 }
 
 // ======================================
-// API: POST /api/chat
+// POST /api/chat
 // ======================================
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, history = [] } = req.body
+    const { message, history = [], language = 'en' } = req.body
+    if (!message?.trim()) return res.status(400).json({ error: 'Please provide a message' })
 
-    if (!message?.trim()) {
-      return res.status(400).json({ error: 'กรุณาส่งข้อความมาด้วยครับ' })
+    let ibeContext = ''
+    if (message.match(/ราคา|ห้อง|rate|room|price|available|จอง|book|วันนี้|พรุ่งนี้|today|tomorrow|weekend|สุดสัปดาห์/i)) {
+      const dates = extractDates(message)
+      const ibeData = await fetchIBERate(dates)
+      const ibeText = formatIBERate(ibeData, dates.checkIn, dates.checkOut)
+      if (ibeText) ibeContext = ibeText
     }
 
-    // ดึงข้อมูลจาก DB ตามคำถาม
-    const hotelContext = await getHotelContext(message)
+    const system = `You are BOSO, the AI concierge for Soraso Hotel.
+Reply in ${language === 'th' ? 'Thai' : 'English'}, friendly, concise, and professional.
+Use ONLY the information below. If unsure, offer to connect with staff.
 
-    // System prompt
-    const systemPrompt = `คุณคือ AI Assistant ของโรงแรม ชื่อ "น้อง SORA" 
-คุณพูดภาษาไทยเป็นหลัก สุภาพ เป็นมิตร และช่วยเหลือลูกค้าอย่างเต็มที่
-ตอบคำถามโดยอิงจากข้อมูลด้านล่างเท่านั้น หากไม่มีข้อมูลให้บอกว่าจะสอบถามพนักงานให้
+${ibeContext}
 
-${hotelContext}
+${HOTEL_INFO}
 
-แนวทางการตอบ:
-- ตอบกระชับ ชัดเจน ไม่เยิ่นเย้อ
-- ใช้ emoji ประกอบบ้างเล็กน้อยเพื่อความเป็นมิตร
-- ถ้าลูกค้าสนใจจอง ให้แนะนำให้โทร 02-111-1111 หรือ LINE: @soraso
-- ห้ามสร้างข้อมูลที่ไม่มีในฐานข้อมูล`
-
-    // สร้าง messages array พร้อม history
-    const messages = [
-      ...history.slice(-10), // เก็บ history แค่ 10 ข้อความล่าสุด
-      { role: 'user', content: message }
-    ]
+Guidelines:
+- Keep answers short and clear
+- If rates are from IBE, mention "current rate"
+- For bookings: soraso-ibe-qa.vercel.app or call 053-000-000
+- Never make up information not listed above
+- Use minimal emoji`
 
     const response = await claude.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
-      system: systemPrompt,
-      messages
+      system,
+      messages: [...history.slice(-8), { role: 'user', content: message }]
     })
 
-    res.json({
-      reply: response.content[0].text,
-      role: 'assistant'
-    })
-
+    res.json({ reply: response.content[0].text, role: 'assistant' })
   } catch (err) {
-    console.error('Chat error:', err)
-    res.status(500).json({ error: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' })
+    console.error('Chat error:', err.message)
+    res.status(500).json({ error: 'Something went wrong. Please try again.' })
   }
 })
 
-// Health check
-app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
+app.get('/api/health', (_, res) => res.json({ status: 'ok', bot: 'BOSO', version: '2.0.0' }))
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`🏨 Hotel Chatbot running on http://localhost:${PORT}`))
+app.listen(PORT, () => console.log(`🤖 BOSO Chatbot v2.0 running on http://localhost:${PORT}`))
